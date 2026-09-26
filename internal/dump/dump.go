@@ -42,10 +42,11 @@ func Run(device bledevice.Device, deviceName, address string, services []bledevi
 	subscribed, failed := 0, 0
 	for _, ch := range flat {
 		uuid, i := ch.Char.UUID(), ch.Index
-		err := ch.Char.EnableNotifications(func(buf []byte) {
+		err := enableNotificationsWithTimeout(ch.Char, func(buf []byte) {
 			fmt.Printf("[%s] notify [%d] %s = %s\n", time.Now().Format("15:04:05"), i, uuid, hex.EncodeToString(buf))
-		})
+		}, 5*time.Second)
 		if err != nil {
+			fmt.Printf("  [%d] %s: no notifications (%s)\n", i, uuid, err)
 			failed++
 			continue
 		}
@@ -76,4 +77,22 @@ func readOrNote(ch bledevice.Characteristic) string {
 		return "(empty)"
 	}
 	return hex.EncodeToString(val)
+}
+
+// enableNotificationsWithTimeout guards EnableNotifications with a
+// deadline: some characteristics look notify-capable but never actually
+// complete the subscribe (e.g. no CCCD descriptor behind a GATT server
+// quirk), and a naive call can block forever - which, unlike a normal
+// error, silently wedges the whole watch loop with no diagnostic. The
+// underlying call is left running in its goroutine if it times out; it's
+// harmless since the process is short-lived.
+func enableNotificationsWithTimeout(ch bledevice.Characteristic, cb func([]byte), timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() { done <- ch.EnableNotifications(cb) }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("timed out after %s", timeout)
+	}
 }
