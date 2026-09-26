@@ -1,0 +1,11 @@
+/ploom-cli
+/ploom-cli.exe
+*.o
+*.test
+
+# PlatformIO build artifacts (tools/M5central)
+.pio/
+.vscode/
+
+# config.toml is a runtime artifact written by ploom-cli itself, not source
+config.toml
