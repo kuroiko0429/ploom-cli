@@ -6,11 +6,10 @@ A small BLE CLI for Ploom-brand heated tobacco devices, in the spirit of
 - **`bluez`** (default): talks to BlueZ over D-Bus directly via
   [`tinygo.org/x/bluetooth`](https://pkg.go.dev/tinygo.org/x/bluetooth), so
   it runs alongside a normal `bluetoothd` — no raw HCI socket, no root
-  required. **Confirmed broken against the Ploom aura on one specific
-  controller (Intel AX201 / `btintel`), confirmed working out of the box on
-  another (Realtek RTL8852BU / `btrtl`)** — see "Known device behavior"
-  below. Try this first; it's the simplest transport and may just work on
-  your hardware.
+  required. **Connects only intermittently against the Ploom aura** across
+  every controller tested so far (Intel AX201, Realtek RTL8852BU) - see
+  "Known device behavior" below. Worth trying since it needs no extra
+  hardware/root, but don't rely on it.
 - **`serial`**: delegates the actual BLE work to a microcontroller (an
   M5StickC Plus2 running the firmware in [`tools/M5central`](tools/M5central),
   NimBLE-Arduino) reached over USB-serial. This is the one **confirmed
@@ -163,8 +162,9 @@ fixed post-connect command sequence, delaying delivery of the peripheral's
 first packet — not at connection parameters, which are provably not the
 problem.
 
-**Root cause, narrowed to this host's Intel AX201 controller/driver
-(`btintel`), not BlueZ in general.** An M5StickC Plus2 running NimBLE-Arduino
+**Root cause: this host's fixed post-connect command sequence loses a race
+against the peripheral's patience window, not the device itself.** An
+M5StickC Plus2 running NimBLE-Arduino
 (see [`tools/M5central`](tools/M5central)) connects to the same Ploom aura
 unit over and over without issue: pairs, bonds (`bonded=true
 encrypted=true`), and discovers the full GATT table (5 services, 21
@@ -177,26 +177,32 @@ defect is on this host. `-transport serial` in ploom-cli routes through it
 workaround: same `ploom-cli` binary, same REPL, same `config.toml`, just a
 different transport underneath.
 
-**Confirmed: `-transport bluez` (plain, unmodified, no flags) connects fine
-on a second machine with a Realtek RTL8852BU (`btrtl` driver) instead of
-the Intel AX201 (`btintel` driver) used for all of the investigation above.**
-Same binary, no config changes, connected and reached the REPL on the first
-try. This rules out "BlueZ is broken for this device" as a general claim -
-every earlier finding in this section (the ~2-event disconnect, the
-falsified interval hypothesis, the post-connect-command-timing lead) is
-specific to the Intel AX201/`btintel` combination this project was
-originally developed against. **If your Bluetooth adapter isn't an Intel
-one, try plain `-transport bluez` first** - it may just work, no
-microcontroller or root access needed.
+**Update: retracted.** `-transport bluez` connected successfully once on a
+second machine (Realtek RTL8852BU, `btrtl` driver) on the very first try,
+which briefly looked like proof this was an Intel-AX201-specific defect. A
+second attempt on the *same* Realtek machine, minutes later, failed with
+the exact same `le-connection-abort-by-local` / ~2-connection-event
+disconnect as every Intel AX201 capture in this document. So it is not
+deterministically "Intel breaks, everything else works" - the earlier
+success looks like it was a timing fluke, not evidence of an Intel-specific
+driver defect. This is actually consistent with the "current best lead"
+above (a race against the peripheral's short patience window): if success
+depends on a fixed post-connect command sequence finishing before the
+device gives up, it would be expected to succeed *sometimes* on any
+controller if the OS happens to schedule things fast enough that run, not
+split cleanly by chipset. Treat `-transport bluez` as "may work, may not,
+seemingly unpredictably" on any hardware rather than relying on the
+earlier "try non-Intel hardware" advice - **`-transport serial` remains the
+only transport confirmed to work reliably** (every attempt so far, no
+failures).
 
-**On an Intel AX201 (or other `btintel`-driven controller) specifically:**
-every config-level lever (`main.conf`, direct mgmt calls) was tried and
-ruled out; the remaining leads are `btintel`'s driver-level timing or the
-AX201 controller's own HCI response latency for the post-connect command
-sequence, both out of scope to patch here. Use `-transport serial` for this
-combination. `bluetoothctl remove <MAC>` before retrying `-transport bluez`
-is still worth doing to clear stale bond state, but won't fix the
-underlying issue on this controller.
+Every config-level lever (`main.conf`, direct mgmt calls) was tried and
+ruled out on the original Intel AX201 host; nothing rules out the same
+underlying cause (whatever delays this host's fixed post-connect command
+sequence past the peripheral's patience window) applying, at lower
+probability, on other controllers too. `bluetoothctl remove <MAC>` before
+retrying `-transport bluez` is worth doing to clear stale bond state, but
+didn't change the outcome in this retest.
 
 **`-transport rawhci`: an alternative to needing a microcontroller,
 written but not verified.** Since the leading theory was BlueZ/the kernel's
