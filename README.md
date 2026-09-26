@@ -6,15 +6,17 @@ A small BLE CLI for Ploom-brand heated tobacco devices, in the spirit of
 - **`bluez`** (default): talks to BlueZ over D-Bus directly via
   [`tinygo.org/x/bluetooth`](https://pkg.go.dev/tinygo.org/x/bluetooth), so
   it runs alongside a normal `bluetoothd` — no raw HCI socket, no root
-  required. **Connects only intermittently against the Ploom aura** across
-  every controller tested so far (Intel AX201, Realtek RTL8852BU) - see
-  "Known device behavior" below. Worth trying since it needs no extra
-  hardware/root, but don't rely on it.
+  required. **Confirmed reliable against the Ploom aura, with one catch:
+  the device must be in its pairing/setup mode when you connect** (see
+  "Known device behavior" below for the trigger) - without that, connects
+  fail intermittently on every controller tested. Try this first.
 - **`serial`**: delegates the actual BLE work to a microcontroller (an
   M5StickC Plus2 running the firmware in [`tools/M5central`](tools/M5central),
-  NimBLE-Arduino) reached over USB-serial. This is the one **confirmed
-  working** against the Ploom aura unit — see below for why. Requires
-  flashing a microcontroller.
+  NimBLE-Arduino) reached over USB-serial. Confirmed working, does a real
+  SMP pairing/bond (unlike the `bluez` path below). Whether it also needs
+  the device in pairing mode to connect, same as `bluez`, wasn't isolated -
+  every test happened to be done with the device recently in that state.
+  Requires flashing a microcontroller.
 - **`rawhci`**: a from-scratch BLE central
   ([`internal/hcible`](internal/hcible)) that opens the adapter directly via
   a raw `HCI_CHANNEL_USER` socket, bypassing BlueZ/bluetoothd entirely and
@@ -117,11 +119,29 @@ you expect are missing.
 
 ## Known device behavior
 
+**The fix, confirmed reliable: put the device into its pairing/setup mode
+before connecting.** On a "Ploom aura" unit: open and close the slide
+cover, then hold the button for ~5 seconds until its LED starts blinking.
+Connecting with plain `-transport bluez` while the LED is blinking succeeds
+every time (3/3 in a row in testing) - the LED goes solid/off on success.
+No SMP pairing or bonding is needed at all: every characteristic, including
+the vendor `0xfef5` control service, reads fine over a plain unauthenticated
+ATT connection (`bluetoothctl info` shows `Paired: no` / `Bonded: no` the
+whole time). Once one connection has landed this way, later reconnects -
+without repeating the physical trigger - keep succeeding too, for some
+unmeasured period afterward. Everything below this point was diagnosed
+*without* knowing about this trigger, connecting to the device in its
+untouched background-advertising state, where connections fail almost
+every time; it's kept for the record and because `-transport serial`/
+`rawhci` remain useful when you can't reach the device's button (e.g.
+scripted/headless use).
+
 Scanning correctly finds real Ploom devices (verified against a "Ploom aura"
 unit: `Ploom aura 802029KL`, address type `public`, single vendor-specific
-service `53654010-a391-4a65-83fa-bc58084aca28`). The connect step, however,
-fails on that unit with `le-connection-abort-by-local` (and pairing fails
-with `AuthenticationCanceled`) — reproducible with plain `bluetoothctl
+service `53654010-a391-4a65-83fa-bc58084aca28`). Without the pairing-mode
+trigger above, the connect step fails on that unit with
+`le-connection-abort-by-local` (and pairing fails with
+`AuthenticationCanceled`) — reproducible with plain `bluetoothctl
 connect`/`pair` too, so it's a BlueZ/device-level negotiation issue, not a
 ploom-cli bug.
 
@@ -162,9 +182,9 @@ fixed post-connect command sequence, delaying delivery of the peripheral's
 first packet — not at connection parameters, which are provably not the
 problem.
 
-**Root cause: this host's fixed post-connect command sequence loses a race
-against the peripheral's patience window, not the device itself.** An
-M5StickC Plus2 running NimBLE-Arduino
+**Interim theory at the time (superseded below): this host's fixed
+post-connect command sequence loses a race against the peripheral's
+patience window.** An M5StickC Plus2 running NimBLE-Arduino
 (see [`tools/M5central`](tools/M5central)) connects to the same Ploom aura
 unit over and over without issue: pairs, bonds (`bonded=true
 encrypted=true`), and discovers the full GATT table (5 services, 21
@@ -177,32 +197,25 @@ defect is on this host. `-transport serial` in ploom-cli routes through it
 workaround: same `ploom-cli` binary, same REPL, same `config.toml`, just a
 different transport underneath.
 
-**Update: retracted.** `-transport bluez` connected successfully once on a
-second machine (Realtek RTL8852BU, `btrtl` driver) on the very first try,
-which briefly looked like proof this was an Intel-AX201-specific defect. A
-second attempt on the *same* Realtek machine, minutes later, failed with
-the exact same `le-connection-abort-by-local` / ~2-connection-event
-disconnect as every Intel AX201 capture in this document. So it is not
-deterministically "Intel breaks, everything else works" - the earlier
-success looks like it was a timing fluke, not evidence of an Intel-specific
-driver defect. This is actually consistent with the "current best lead"
-above (a race against the peripheral's short patience window): if success
-depends on a fixed post-connect command sequence finishing before the
-device gives up, it would be expected to succeed *sometimes* on any
-controller if the OS happens to schedule things fast enough that run, not
-split cleanly by chipset. Treat `-transport bluez` as "may work, may not,
-seemingly unpredictably" on any hardware rather than relying on the
-earlier "try non-Intel hardware" advice - **`-transport serial` remains the
-only transport confirmed to work reliably** (every attempt so far, no
-failures).
+**Resolved.** `-transport bluez` connected successfully once on a second
+machine (Realtek RTL8852BU, `btrtl` driver), then failed identically to
+every Intel AX201 capture on two subsequent attempts minutes later - at the
+time this looked like proof the earlier "success" was a pure timing fluke,
+unrelated to chipset. It turned out to be neither purely random nor
+chipset-specific: every failure in this whole investigation, on both
+machines, was connecting to the device in its untouched background-
+advertising state. The isolated Realtek success almost certainly landed
+because the device happened to still be within a patient window from
+recent physical handling (matching the "later reconnects keep succeeding
+for a while" behavior noted above), not because of anything about that
+specific machine. With the pairing-mode trigger, `-transport bluez` is
+reliable on the exact same Realtek machine that produced these failures.
 
 Every config-level lever (`main.conf`, direct mgmt calls) was tried and
-ruled out on the original Intel AX201 host; nothing rules out the same
-underlying cause (whatever delays this host's fixed post-connect command
-sequence past the peripheral's patience window) applying, at lower
-probability, on other controllers too. `bluetoothctl remove <MAC>` before
-retrying `-transport bluez` is worth doing to clear stale bond state, but
-didn't change the outcome in this retest.
+ruled out on the original Intel AX201 host before the pairing-mode trigger
+was found; they're kept below as an accurate record of the background-
+advertising-state failure mode, which is still worth understanding if you
+ever see it (e.g. if you can't reach the device's button).
 
 **`-transport rawhci`: an alternative to needing a microcontroller,
 written but not verified.** Since the leading theory was BlueZ/the kernel's

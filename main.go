@@ -359,57 +359,56 @@ func confirm(prompt string) (bool, error) {
 // diagnosed via btmon/Android HCI snoop captures on a Ploom aura unit, for
 // the -transport bluez path specifically.
 //
-// Confirmed facts (all reproduced with sudo btmon):
-//   - The link establishes (LE Enhanced Connection Complete: Success) and
-//     the peripheral itself terminates it (Disconnect reason: Remote User
+// Confirmed facts:
+//   - In the device's normal/background advertising state, the link
+//     establishes (LE Enhanced Connection Complete: Success) and the
+//     peripheral itself terminates it (Disconnect reason: Remote User
 //     Terminated Connection) after almost exactly 2 connection events -
 //     ~85ms at BlueZ's default 45ms interval, ~33ms after forcing a 15ms
 //     interval via a manual MGMT_OP_LOAD_CONN_PARAM (0x0035) call matching
-//     Android's proven-working values (15ms interval / 5s supervision
-//     timeout) - with zero L2CAP/SMP/ATT packets exchanged either way.
-//   - So the peripheral's patience is event-count-based, not wall-clock
-//     based, and matching Android's connection interval does NOT fix this:
-//     the interval hypothesis is falsified by direct experiment.
-//   - BlueZ's main.conf [LE] MinConnectionInterval/MaxConnectionInterval are
-//     dead config on Linux for Device1.Connect() anyway (upstream bug,
-//     bluez/bluez#293): device.c's device_connect_le() calls bt_io_connect()
-//     with no interval options at all, so the kernel's own default (30-50ms)
-//     is always used unless overridden per-device via the mgmt socket
-//     directly (MGMT_OP_LOAD_CONN_PARAM), which is the only way that
-//     actually reaches the HCI command - confirmed by btmon.
-//   - An Android HCI snoop log of the vendor app both reconnecting to, and
-//     freshly pairing with, the same unit shows the peripheral sending an
-//     SMP Security Request ~24-29ms after connecting either way, and the
-//     phone's stack receiving it fine while a "LE Read Remote Features"
-//     command is still outstanding. In our own captures that same "LE Read
-//     Remote Used Features" command's completion arrives carrying the
-//     disconnect status - no incoming ACL/SMP data is ever seen first. That
-//     points at this host's controller/driver (or BlueZ/kernel's fixed
-//     post-connect command sequence) delaying delivery of the peripheral's
-//     first packet, not at connection parameters.
-//   - Confirmed fix: an M5StickC Plus2 running NimBLE-Arduino (see
-//     tools/M5central) connects, pairs, and discovers the full GATT table
-//     of the same unit without issue. Use -transport serial to route
-//     through it instead of fighting BlueZ further.
+//     Android's proven-working values - with zero L2CAP/SMP/ATT packets
+//     exchanged either way. So the peripheral's patience in this state is
+//     event-count-based, not wall-clock based, and matching Android's
+//     connection interval does NOT fix it (falsified by direct experiment).
+//     BlueZ's main.conf [LE] interval settings are also dead config for
+//     Device1.Connect() on Linux regardless (upstream bug,
+//     bluez/bluez#293).
+//   - Confirmed fix, reproduced repeatedly: put the device into its
+//     dedicated pairing/setup mode first - on a "Ploom aura" unit, open and
+//     close the slide cover, then hold the button for ~5 seconds until the
+//     LED starts blinking. Connecting with plain -transport bluez while
+//     the LED is blinking succeeds every time (LED goes solid/off on
+//     success), and - surprisingly - no SMP pairing/bonding is required at
+//     all: reads work on every characteristic including the vendor
+//     0xfef5 control service straight over an unauthenticated ATT link.
+//     Once one connection has landed this way, later reconnects (without
+//     repeating the physical trigger) keep succeeding for some time
+//     afterward - the short-patience state above is apparently specific to
+//     the device's untouched background-advertising mode.
+//   - -transport serial (an M5StickC Plus2 running NimBLE-Arduino, see
+//     tools/M5central) and -transport rawhci remain available as
+//     alternatives that don't need the physical trigger, for unattended/
+//     headless use.
 func printConnectFailureHint() {
 	fmt.Fprint(os.Stderr, `
 connect failed after all retries. If the failure looks like
-"le-connection-abort-by-local", a btmon capture on a Ploom aura unit showed
-the peripheral itself terminating the link (reason: Remote User Terminated
-Connection) after ~2 connection events, before any GATT/SMP packet went out.
+"le-connection-abort-by-local", this is almost certainly the Ploom's
+background advertising state being too impatient for BlueZ's connection
+setup - confirmed fix:
 
-This has been diagnosed as far as BlueZ/kernel config allows and is a dead
-end there: it is NOT a connection interval problem (verified: forcing the
-exact interval Android uses via a direct mgmt MGMT_OP_LOAD_CONN_PARAM call
-still failed, just proportionally faster), and BlueZ's main.conf connection
-interval settings don't even reach the HCI command bluetoothd sends (upstream
-bug, bluez/bluez#293).
+  1. Put the device into pairing/setup mode: open and close the slide
+     cover, then hold the button for ~5 seconds until its LED starts
+     blinking.
+  2. Immediately retry this same command while the LED is blinking.
 
-Confirmed working alternative: an M5StickC Plus2 running NimBLE-Arduino (see
-tools/M5central in this repo) connects to the same device fine. Flash that
-firmware and rerun with:
+No pairing/bonding is needed - a plain unauthenticated connection works
+once it lands during that window, and stays reliable for later reconnects
+afterward too.
 
-  ploom-cli -transport serial -port /dev/ttyACM0
+If that doesn't help, -transport serial (an M5StickC Plus2 running
+NimBLE-Arduino, see tools/M5central in this repo) and -transport rawhci are
+available as alternatives - see the README's "Known device behavior"
+section.
 `)
 }
 
